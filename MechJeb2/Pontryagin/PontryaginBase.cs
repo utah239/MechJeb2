@@ -40,7 +40,8 @@ namespace MuMech {
             public bool done { get { return (stage != null && stage.staged) || _done; } set { _done = value; } }
             public bool coast = false;
             public bool coast_after_jettison = false;
-            public bool use_fixed_time = false;
+            public bool use_fixed_time = false; // confusingly, this is fixed end-time for terminal coasts to rendezvous
+            public bool use_fixed_time2 = false; // this is a fixed time segment, but the constant appears in the y0 vector with a trivial constraint
             public double fixed_time = 0;
             public double fixed_tbar = 0;
 
@@ -876,27 +877,35 @@ namespace MuMech {
             double total_bt_bar = 0;
             for(int i = 0; i < arcs.Count; i++)
             {
-                if ( arcs[i].coast && !arcs[i].use_fixed_time )
+                if ( arcs[i].coast )
                 {
-                    int index = arcIndex(arcs, i);
+                    if (arcs[i].use_fixed_time2)
+                    {
+                        int index = arcIndex(arcs, i, parameters: true);
+                        z[n] = y0[index] - arcs[i].fixed_tbar;
+                    }
+                    else if  (!arcs[i].use_fixed_time )
+                    {
+                        int index = arcIndex(arcs, i);
 
-                    Vector3d r = new Vector3d(y0[index+0], y0[index+1], y0[index+2]);
-                    Vector3d v = new Vector3d(y0[index+3], y0[index+4], y0[index+5]);
-                    Vector3d pv = new Vector3d(y0[index+6], y0[index+7], y0[index+8]);
-                    Vector3d pr = new Vector3d(y0[index+9], y0[index+10], y0[index+11]);
-                    double rm = r.magnitude;
+                        Vector3d r = new Vector3d(y0[index+0], y0[index+1], y0[index+2]);
+                        Vector3d v = new Vector3d(y0[index+3], y0[index+4], y0[index+5]);
+                        Vector3d pv = new Vector3d(y0[index+6], y0[index+7], y0[index+8]);
+                        Vector3d pr = new Vector3d(y0[index+9], y0[index+10], y0[index+11]);
+                        double rm = r.magnitude;
 
-                    Vector3d r2 = new Vector3d(yf[i*13+0], yf[i*13+1], yf[i*13+2]);
-                    Vector3d v2 = new Vector3d(yf[i*13+3], yf[i*13+4], yf[i*13+5]);
-                    Vector3d pv2 = new Vector3d(yf[i*13+6], yf[i*13+7], yf[i*13+8]);
-                    Vector3d pr2 = new Vector3d(yf[i*13+9], yf[i*13+10], yf[i*13+11]);
-                    double r2m = r2.magnitude;
+                        Vector3d r2 = new Vector3d(yf[i*13+0], yf[i*13+1], yf[i*13+2]);
+                        Vector3d v2 = new Vector3d(yf[i*13+3], yf[i*13+4], yf[i*13+5]);
+                        Vector3d pv2 = new Vector3d(yf[i*13+6], yf[i*13+7], yf[i*13+8]);
+                        Vector3d pr2 = new Vector3d(yf[i*13+9], yf[i*13+10], yf[i*13+11]);
+                        double r2m = r2.magnitude;
 
-                    double H0t1 = Vector3d.Dot(pr, v) - Vector3d.Dot(pv, r) / (rm * rm * rm);
-                    double H0t2 = Vector3d.Dot(pr2, v2) - Vector3d.Dot(pv2, r2) / (r2m * r2m * r2m);
+                        double H0t1 = Vector3d.Dot(pr, v) - Vector3d.Dot(pv, r) / (rm * rm * rm);
+                        double H0t2 = Vector3d.Dot(pr2, v2) - Vector3d.Dot(pv2, r2) / (r2m * r2m * r2m);
 
-                    z[n] = H0t2;
-                    n++;
+                        z[n] = H0t2;
+                        n++;
+                    }
                 }
                 // sum up burntime of burn arcs
                 if ( !arcs[i].coast )
@@ -1125,7 +1134,7 @@ namespace MuMech {
                     // since we shift the zero of tbar forwards on every re-optimize we have to do this here
                     for(int i = 0; i < last_arcs.Count; i++)
                     {
-                        if ( last_arcs[i].use_fixed_time )
+                        if ( last_arcs[i].use_fixed_time || last_arcs[i].use_fixed_time2 )
                         {
                             last_arcs[i].fixed_tbar = ( last_arcs[i].fixed_time - t0 ) / t_scale;
                         }
@@ -1258,16 +1267,29 @@ namespace MuMech {
             }
         }
 
+        // Minimum viable message Queue
         Queue<string> logQueue = new Queue<string>();
         Mutex mut = new Mutex();
 
-        // lets us Debug.Log events from the computation thread in a thread-safe fashion
+        // NOTE: The Debug.Log() method is NOT THREADSAFE IN UNITY and causes CTD.
+        //
+        // All functions in the optimizer which runs in a separate thread (nearly every single one
+        // of them) must call DebugLog() and not Debug.Log().
         //
         protected void DebugLog(string s)
         {
             mut.WaitOne();
             logQueue.Enqueue(s);
             mut.ReleaseMutex();
+        }
+
+        // Similarly we can't log fatal stacktraces to the log from the thread, so we have to save state
+        // here in order for the Janitorial() task to Debug.Log them properly.
+        //
+        protected void Fatal(string s)
+        {
+            last_failure_cause = s;
+            y0 = null;
         }
 
         // need to call this every tick or so in order to dump exceptions to the log from
@@ -1303,16 +1325,12 @@ namespace MuMech {
             mut.ReleaseMutex();
         }
 
+        // Does what it says on the tin.
+        //
         public void KillThread()
         {
             if (thread != null)
                 thread.Abort();
-        }
-
-        protected void Fatal(string s)
-        {
-            last_failure_cause = s;
-            y0 = null;
         }
     }
 }

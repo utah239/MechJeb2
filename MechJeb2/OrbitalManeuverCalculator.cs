@@ -173,21 +173,17 @@ namespace MuMech
         //given latitude, then this function returns either 90 (if -90 < inclination < 90) or 270.
         public static double HeadingForInclination(double inclinationDegrees, double latitudeDegrees)
         {
-            double cosDesiredSurfaceAngle = Math.Cos(inclinationDegrees * UtilMath.Deg2Rad) / Math.Cos(latitudeDegrees * UtilMath.Deg2Rad);
-            if (Math.Abs(cosDesiredSurfaceAngle) > 1.0)
-            {
-                //If inclination < latitude, we get this case: the desired inclination is impossible
-                if (Math.Abs(MuUtils.ClampDegrees180(inclinationDegrees)) < 90) return 90;
-                else return 270;
-            }
-            else
-            {
-                double angleFromEast = (UtilMath.Rad2Deg) * Math.Acos(cosDesiredSurfaceAngle); //an angle between 0 and 180
-                if (inclinationDegrees < 0) angleFromEast *= -1;
-                //now angleFromEast is between -180 and 180
+            // this produces northgoing headings of [-90, 90]
+            double headingDegrees = Math.Asin( MuUtils.Clamp( Math.Cos(inclinationDegrees * UtilMath.Deg2Rad) / Math.Cos(latitudeDegrees * UtilMath.Deg2Rad), -1, 1 ) ) * UtilMath.Rad2Deg;
 
-                return MuUtils.ClampDegrees360(90 - angleFromEast);
-            }
+            // this produces southgoing headings of [90, 270] when the calling inclination is negative
+            // NOTE: that all negative inclination headings are southgoing, so that -270 degree inclination acts like -90 degrees, not like 90 degrees.
+            //       callers should call pass us MuUtils.ClampDegrees180(inclinationDegrees) if they want that kind of behavior.
+            if ( inclinationDegrees < 0 )
+                headingDegrees = 180 - headingDegrees;
+
+            // this maps [-90, 0) headings to [270, 360) for [0, 360)
+            return MuUtils.ClampDegrees360(headingDegrees);
         }
 
         //See #676

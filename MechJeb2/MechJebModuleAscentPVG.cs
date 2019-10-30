@@ -18,8 +18,6 @@ namespace MuMech
         [Persistent(pass = (int)(Pass.Type | Pass.Global))]
         public EditableDouble pitchRate = new EditableDouble(0.50);
         [Persistent(pass = (int)(Pass.Type | Pass.Global))]
-        public EditableDoubleMult desiredApoapsis = new EditableDoubleMult(0, 1000);
-        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
         public bool omitCoast = false;
 
         private MechJebModuleAscentGuidance ascentGuidance { get { return core.GetComputerModule<MechJebModuleAscentGuidance>(); } }
@@ -107,19 +105,109 @@ namespace MuMech
             double vt = 0;
             double rt = 0;
 
-            ConvertToSMAEcc(autopilot.desiredOrbitAltitude, desiredApoapsis, out sma, out ecc);
-            ConvertToVTRT(sma, ecc, 0, out rt, out vt);
+            if ( autopilot.pvgTargetIdxPublic == pvgTargetType.KEPLER_HUMAN || autopilot.pvgTargetIdxPublic == pvgTargetType.FLIGHTANGLE_HUMAN )
+            {
+                if ( autopilot.desiredShapeMode == 1 && core.target.NormalTargetExists )
+                    ConvertToSMAEcc(core.target.TargetOrbit.PeA, core.target.TargetOrbit.ApA, out sma, out ecc);
+                else
+                    ConvertToSMAEcc(autopilot.desiredPeriapsis, autopilot.desiredApoapsis, out sma, out ecc);
+            }
+
+            if ( autopilot.pvgTargetIdxPublic == pvgTargetType.KEPLER || autopilot.pvgTargetIdxPublic == pvgTargetType.FLIGHTANGLE )
+            {
+                if ( autopilot.desiredShapeMode == 1 && core.target.NormalTargetExists )
+                {
+                    sma = core.target.TargetOrbit.semiMajorAxis;
+                    ecc = core.target.TargetOrbit.eccentricity;
+                }
+                else
+                {
+                    sma = autopilot.desiredSMA;
+                    ecc = autopilot.desiredECC;
+                }
+            }
+
+            if ( autopilot.pvgTargetIdxPublic == pvgTargetType.FLIGHTANGLE || autopilot.pvgTargetIdxPublic == pvgTargetType.FLIGHTANGLE_HUMAN )
+            {
+                ConvertToVTRT(sma, ecc, autopilot.desiredFPA, out rt, out vt);
+            }
+
             double inclination = autopilot.desiredInclination;
 
-            if ( ascentGuidance.launchingToPlane && core.target.NormalTargetExists )
-            {
-                double LAN = core.target.TargetOrbit.LAN;;
+            if ( autopilot.desiredIncMode == 1 && core.target.NormalTargetExists )
                 inclination = core.target.TargetOrbit.inclination;
-                core.guidance.flightangle5constraint(rt, vt, inclination, 0, LAN, sma, omitCoast, false);
-            }
-            else
+
+            if ( autopilot.desiredIncMode == 2 )
+                inclination = vessel.orbit.inclination;
+
+            double LAN = autopilot.desiredLAN;
+
+            if ( autopilot.desiredLANMode == 1 && core.target.NormalTargetExists )
+                LAN = core.target.TargetOrbit.LAN;
+
+            double ArgP = autopilot.desiredArgP;
+
+            if ( autopilot.desiredArgPMode == 1 && core.target.NormalTargetExists )
+                ArgP = core.target.TargetOrbit.argumentOfPeriapsis;
+
+            if ( autopilot.pvgTargetIdxPublic == pvgTargetType.KEPLER_HUMAN || autopilot.pvgTargetIdxPublic == pvgTargetType.KEPLER )
             {
-                core.guidance.flightangle4constraint(rt, vt, inclination, 0, sma, omitCoast, false);
+                if ( autopilot.desiredLANMode == 2 ) // free
+                {
+                    if ( autopilot.desiredArgPMode == 2 ) // free
+                    {
+                        // 3 constraint -- LAN, ArgP, TA free
+                        core.guidance.keplerian3constraint(sma, ecc, inclination, omitCoast, autopilot.desiredIncMode == 2);
+                        // FIXME: push LAN + ArgP into autopilot
+                    }
+                    else
+                    {
+                        // 4 constraint -- LAN, TA free
+                        core.guidance.keplerian4constraintLANfree(sma, ecc, inclination, ArgP, omitCoast, autopilot.desiredIncMode == 2);
+                        // FIXME: push LAN into autopilot
+                    }
+                }
+                else
+                {
+                    if ( autopilot.desiredArgPMode == 2 ) // free
+                    {
+                        // 4 constraint -- ArgP, TA free
+                        core.guidance.keplerian4constraintArgPfree(sma, ecc, inclination, LAN, omitCoast, autopilot.desiredIncMode == 2);
+                        // FIXME: push ArgP into autopilot
+                    }
+                    else
+                    {
+                        // 5 constraint -- TA free
+                        core.guidance.keplerian5constraint(sma, ecc, inclination, LAN, ArgP, omitCoast, autopilot.desiredIncMode == 2);
+                    }
+                }
+            }
+            if ( autopilot.pvgTargetIdxPublic == pvgTargetType.FLIGHTANGLE_HUMAN || autopilot.pvgTargetIdxPublic == pvgTargetType.FLIGHTANGLE )
+            {
+                if ( autopilot.desiredLANMode == 2 ) // free
+                {
+                    // 4 constraint -- LAN and ArgP free
+                    core.guidance.flightangle4constraint(rt, vt, inclination, autopilot.desiredFPA, sma, omitCoast, autopilot.desiredIncMode == 2);
+                    // FIXME: push LAN into autopilot
+                }
+                else
+                {
+                    // 5 constraint -- ArgP free
+                    core.guidance.flightangle5constraint(rt, vt, inclination, autopilot.desiredFPA, LAN, sma, omitCoast, autopilot.desiredIncMode == 2);
+                }
+            }
+            if ( autopilot.pvgTargetIdxPublic == pvgTargetType.MAXNRG )
+            {
+                double rTm = autopilot.desiredAltitude + mainBody.Radius;
+                sma = Math.Sqrt(mainBody.gravParameter / rTm);
+                if ( autopilot.desiredLANMode == 2 ) // free
+                {
+                    core.guidance.flightangle3constraintMAXE(rTm, autopilot.desiredFPA, inclination, autopilot.maxStages, sma, omitCoast, autopilot.desiredIncMode == 2);
+                }
+                else
+                {
+                    core.guidance.flightangle4constraintMAXE(rTm, autopilot.desiredFPA, inclination, LAN, autopilot.maxStages, sma, omitCoast, autopilot.desiredIncMode == 2);
+                }
             }
         }
 

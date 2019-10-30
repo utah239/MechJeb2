@@ -408,7 +408,7 @@ namespace MuMech
 
             bool doupdate = false;
 
-            if (sma != old_sma || ecc != old_ecc || inc != old_inc || LAN != old_LAN || ArgP != old_ArgP)
+            if (sma != old_sma || ecc != old_ecc || LAN != old_LAN || ArgP != old_ArgP)
                 doupdate = true;
 
             // avoid slight drift in the current inclination from resetting guidance constantly

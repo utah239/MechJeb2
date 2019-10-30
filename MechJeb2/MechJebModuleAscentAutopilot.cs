@@ -5,6 +5,7 @@ using UnityEngine;
 namespace MuMech
 {
     public enum ascentType { CLASSIC, GRAVITYTURN, PVG };
+    public enum pvgTargetType { KEPLER_HUMAN, KEPLER, FLIGHTANGLE_HUMAN, FLIGHTANGLE, MAXNRG };
 
     //Todo: -reimplement measurement of LPA
     //      -Figure out exactly how throttle-limiting should work and interact
@@ -14,6 +15,8 @@ namespace MuMech
         public MechJebModuleAscentAutopilot(MechJebCore core) : base(core) { }
 
         public string status = "";
+
+        // FIXME: use the proper hooks for on saving / loading confignode data to coerce the values
 
         // deliberately private, do not bypass
         [Persistent(pass = (int)(Pass.Type | Pass.Global))]
@@ -25,7 +28,24 @@ namespace MuMech
                 return (ascentType) this.ascentPathIdx;
             }
             set {
+                Debug.Log("set ascentPathIdxPublic in Autopilot");
                 this.ascentPathIdx = (int) value;
+                doWiring();
+            }
+        }
+
+        // deliberately private, do not bypass
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        private int pvgTargetIdx;
+
+        // this is the public API for pvgTargetIdx which is enum type and does wiring
+        public pvgTargetType pvgTargetIdxPublic {
+            get {
+                return (pvgTargetType) this.pvgTargetIdx;
+            }
+            set {
+                Debug.Log("set pvgTargetIdxPublic in Autopilot");
+                this.pvgTargetIdx = (int) value;
                 doWiring();
             }
         }
@@ -33,15 +53,45 @@ namespace MuMech
         // after manually loading the private ascentPathIdx (e.g. from a ConfigNode) this needs to be called to force the wiring
         public void doWiring()
         {
+            Debug.Log("doWiring() called");
             ascentPath = ascentPathForType((ascentType)ascentPathIdx);
             ascentMenu = ascentMenuForType((ascentType)ascentPathIdx);
             disablePathModulesOtherThan(ascentPathIdx);
         }
 
         [Persistent(pass = (int)(Pass.Type | Pass.Global))]
-        public EditableDoubleMult desiredOrbitAltitude = new EditableDoubleMult(100000, 1000);
+        public double desiredOrbitAltitude = 100000; // Classic+GT
         [Persistent(pass = (int)(Pass.Type | Pass.Global))]
-        public double desiredInclination = 0.0;
+        public double desiredAltitude = 185000; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public double desiredPeriapsis = 185000; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public double desiredApoapsis = 0; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public double desiredSMA = 6556000; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public double desiredECC = 0; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public double desiredFPA = 0; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public int maxStages = 2; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public int desiredShapeMode = 0; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public double desiredInclination = 0; // Classic+GT+PVG
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public int desiredIncMode = 0; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public double desiredLAN = 0; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public int desiredLANMode = 2; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public double desiredArgP = 0; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public int desiredArgPMode = 2; // PVG only
+        [Persistent(pass = (int)(Pass.Type | Pass.Global))]
+        public int timedAscentMode = 0; // 0 = NONE, 1 = PLANE, 2 = RENDEZVOUS, 3 = INTERPLANETARY
+
         [Persistent(pass = (int)(Pass.Type | Pass.Global))]
         public bool autoThrottle = true;
         [Persistent(pass = (int)(Pass.Type | Pass.Global))]
@@ -100,16 +150,6 @@ namespace MuMech
         [Persistent(pass = (int)(Pass.Global))]
         public EditableInt warpCountDown = 11;
 
-        [Persistent(pass = (int)(Pass.Global))]
-        public bool showSettings = true;
-        [Persistent(pass = (int)(Pass.Global))]
-        public bool showTargeting = true;
-        [Persistent(pass = (int)(Pass.Global))]
-        public bool showGuidanceSettings = true;
-        [Persistent(pass = (int)(Pass.Global))]
-        public bool showStatus = true;
-
-
         public bool timedLaunch = false;
         public double launchTime = 0;
 
@@ -160,6 +200,7 @@ namespace MuMech
 
         public override void OnModuleEnabled()
         {
+            Debug.Log("MechJebModuleAscentAutopilot: Enabled");
             // since we cannot serialize enums, we serialize ascentPathIdx instead, but this bypasses the code in the property, so on module
             // enabling, we force that value back through the property to enforce sanity.
             doWiring();
@@ -181,6 +222,7 @@ namespace MuMech
 
         public override void OnModuleDisabled()
         {
+            Debug.Log("MechJebModuleAscentAutopilot: Disabled");
             ascentPath.enabled = false;
             core.attitude.attitudeDeactivate();
             if (!core.rssMode)
@@ -193,15 +235,62 @@ namespace MuMech
             status = "Off";
         }
 
-        public void StartCountdown(double time)
+        public void StartCountdown()
         {
+            if ( timedAscentMode == 0 ) // none
+                return;
+
             timedLaunch = true;
-            launchTime = time;
             lastTMinus = 999;
+
+            // we update the desiredLAN/desiredInclination here and the AutopilotGuidance GUI should read it back off
+            // of here when that is appropriate.
+            //
+            if ( timedAscentMode == 1 ) { // plane
+                if ( ascentPathIdxPublic != ascentType.PVG )
+                {
+                    desiredInclination = MuUtils.Clamp(core.target.TargetOrbit.inclination, Math.Abs(vesselState.latitude), 180 - Math.Abs(vesselState.latitude));
+                    desiredInclination *=
+                        Math.Sign(Vector3d.Dot(core.target.TargetOrbit.SwappedOrbitNormal(),
+                                    Vector3d.Cross(vesselState.CoM - mainBody.position, mainBody.transform.up)));
+                    launchTime = vesselState.time + MinimumTimeToPlane(core.target.TargetOrbit.LAN, core.target.TargetOrbit.inclination, launchLANDifference);
+                }
+                else
+                {
+                    if ( desiredIncMode == 1 && core.target.NormalTargetExists ) // targ
+                    {
+                        desiredInclination = core.target.TargetOrbit.inclination;
+                    }
+                    else if ( desiredIncMode == 2 ) // current
+                    {
+                        desiredInclination = vessel.orbit.inclination;
+                    }
+                    if ( desiredLANMode == 1 && core.target.NormalTargetExists ) // targ
+                    {
+                        desiredLAN = core.target.TargetOrbit.LAN;
+                    }
+                    // desiredLANMode == 2 should never happen here
+                    launchTime = vesselState.time + MinimumTimeToPlane(desiredLAN, desiredInclination, 0);
+                }
+            } else if ( timedAscentMode == 2 ) { // rendezvous
+                launchTime = vesselState.time + LaunchTiming.TimeToPhaseAngle(launchPhaseAngle,
+                            mainBody, vesselState.longitude, core.target.TargetOrbit);
+            } else if ( timedAscentMode == 3 ) { // interplanetary
+                //compute the desired launch date
+                OrbitalManeuverCalculator.DeltaVAndTimeForHohmannTransfer(
+                        mainBody.orbit, core.target.TargetOrbit, vesselState.time, out launchTime
+                        );
+                double desiredOrbitPeriod = 2 * Math.PI *
+                    Math.Sqrt( Math.Pow(mainBody.Radius + desiredOrbitAltitude, 3) / mainBody.gravParameter );
+                //launch just before the window, but don't try to launch in the past
+                launchTime -= 3*desiredOrbitPeriod;
+                launchTime = Math.Max(vesselState.time + warpCountDown, launchTime);
+            }
         }
 
         public override void OnFixedUpdate()
         {
+            Debug.Log("MechJebModuleAscentAutopilot: OnFixedUpdate");
             FixupLaunchStart();
             if (timedLaunch)
             {
@@ -274,7 +363,6 @@ namespace MuMech
             }
 
             if (autoThrottle) {
-                Debug.Log("prelaunch killing throttle");
                 core.thrust.ThrustOff();
             }
 
@@ -306,7 +394,6 @@ namespace MuMech
         {
             if (timedLaunch)
             {
-                Debug.Log("Awaiting Liftoff");
                 status = "Awaiting liftoff";
                 // kill the optimizer if it is running.
                 core.guidance.enabled = false;
@@ -380,6 +467,7 @@ namespace MuMech
         //////////////////////////////////////////////////
 
         public string[] ascentPathList = { "Classic Ascent Profile", "Stock-style GravityTurn™", "Primer Vector Guidance (RSS/RO)" };
+        public string[] pvgTargetList = { "Keperian (ApA/PeA)", "Keplerian (SMA/ECC)", "Flightpath Angle (ApA/PeA)", "Flightpath Angle (SMA/ECC)", "Max Energy" };
 
         public MechJebModuleAscentBase ascentPath;
         public MechJebModuleAscentMenuBase ascentMenu;
@@ -423,6 +511,30 @@ namespace MuMech
                 return null;
         }
 
+        // handles picking the smaller time to plane of northgoing and southgoing ground tracks
+        public double MinimumTimeToPlane(double LAN, double inc, double LANDifference)
+        {
+            double one = TimeToPlane(LAN, inc, LANDifference);
+            double two = TimeToPlane(LAN, -inc, LANDifference);
+            return Math.Min(one, two);
+        }
+
+        // seconds of planetary rotation to meet the target plane defined by inc.  safe to call for inclination
+        // below the current latitude.
+        public double TimeToPlane(double LAN, double inc, double LANDifference)
+        {
+            Debug.Log("LAN = " + LAN + " inc = " + inc + " LANDiff = " + LANDifference);
+            // alpha is the 90 degrees angle between the line of longitude and the equator and omitted
+            double beta = OrbitalManeuverCalculator.HeadingForInclination(inc, vesselState.latitude) * UtilMath.Deg2Rad;
+            double c = vesselState.latitude * UtilMath.Deg2Rad;
+            //double gamma = Math.Acos(Math.Sin(beta) * Math.Cos(c)); // law of cosines
+            // b is how many radians to the west of the launch site (-180, 180] that the LAN is
+            double b = Math.Atan2( 2 * Math.Sin(beta), Math.Cos(beta) / Math.Tan(c/2) + Math.Tan(c/2) * Math.Cos(beta) ); // napier's analogies
+            // LAN if we launched now
+            double LANnow = vesselState.orbitLongitude - b * UtilMath.Rad2Deg;
+
+            return MuUtils.ClampDegrees360( LAN - LANnow - LANDifference ) / 360 * mainBody.rotationPeriod;
+        }
     }
 
     public abstract class MechJebModuleAscentMenuBase : DisplayModule
@@ -634,33 +746,6 @@ namespace MuMech
 
 
             return phaseAngleDifference / phaseAngleRate;
-        }
-
-        //Computes the time required for the given launch location to rotate under the target orbital plane.
-        //If the latitude is too high for the launch location to ever actually rotate under the target plane,
-        //returns the time of closest approach to the target plane.
-        //I have a wonderful proof of this formula which this comment is too short to contain.
-        public static double TimeToPlane(double LANDifference, CelestialBody launchBody, double launchLatitude, double launchLongitude, Orbit target)
-        {
-            double inc = Math.Abs(Vector3d.Angle(-target.GetOrbitNormal().Reorder(132).normalized, launchBody.angularVelocity));
-            Vector3d b = Vector3d.Exclude(launchBody.angularVelocity, -target.GetOrbitNormal().Reorder(132).normalized).normalized; // I don't understand the sign here, but this seems to work
-            b *= launchBody.Radius * Math.Sin(UtilMath.Deg2Rad * launchLatitude) / Math.Tan(UtilMath.Deg2Rad * inc);
-            Vector3d c = Vector3d.Cross(-target.GetOrbitNormal().Reorder(132).normalized, launchBody.angularVelocity).normalized;
-            double cMagnitudeSquared = Math.Pow(launchBody.Radius * Math.Cos(UtilMath.Deg2Rad * launchLatitude), 2) - b.sqrMagnitude;
-            if (cMagnitudeSquared < 0) cMagnitudeSquared = 0;
-            c *= Math.Sqrt(cMagnitudeSquared);
-            Vector3d a1 = b + c;
-            Vector3d a2 = b - c;
-
-            Vector3d longitudeVector = launchBody.GetSurfaceNVector(0, launchLongitude);
-
-            double angle1 = Math.Abs(Vector3d.Angle(longitudeVector, a1));
-            if (Vector3d.Dot(Vector3d.Cross(longitudeVector, a1), launchBody.angularVelocity) < 0) angle1 = 360 - angle1;
-            double angle2 = Math.Abs(Vector3d.Angle(longitudeVector, a2));
-            if (Vector3d.Dot(Vector3d.Cross(longitudeVector, a2), launchBody.angularVelocity) < 0) angle2 = 360 - angle2;
-
-            double angle = Math.Min(angle1, angle2) - LANDifference;
-            return (angle / 360) * launchBody.rotationPeriod;
         }
     }
 }

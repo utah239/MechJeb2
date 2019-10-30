@@ -1139,6 +1139,7 @@ namespace MuMech
                 GUI.matrix = Matrix4x4.TRS(Vector3.zero, Quaternion.identity, new Vector3(GuiUtils.scale, GuiUtils.scale, 1));
 
                 GuiUtils.ComboBox.DrawGUI();
+                GuiUtils.ComboBox2.DrawGUI();
 
                 GuiUtils.LoadSkin((GuiUtils.SkinType)settings.skinId);
 
