@@ -107,12 +107,12 @@ namespace MuMech
             //need to set initial consumption rates for VesselThrust and AllowedToStage to work right
             for (int i = 0; i < nodes.Count; i++)
             {
-                nodes[i].SetConsumptionRates(throttle, staticPressure, atmDensity, machNumber);
+                nodes[i].SetConsumptionRates(throttle, atmDensity, machNumber);
             }
 
             Stats stats = new Stats();
             stats.startMass = VesselMass(simStage);
-            stats.startThrust = VesselThrust();
+            stats.startThrust = VesselThrust(throttle, staticPressure, atmDensity, machNumber);
             stats.endMass = stats.startMass;
             stats.resourceMass = 0;
             stats.maxAccel = stats.endMass > 0 ? stats.startThrust / stats.endMass : 0;
@@ -165,11 +165,11 @@ namespace MuMech
             }
             for (int i = 0; i < nodes.Count; i++)
             {
-                nodes[i].SetConsumptionRates(throttle, staticPressure, atmDensity, machNumber);
+                nodes[i].SetConsumptionRates(throttle, atmDensity, machNumber);
             }
 
             stats.startMass = VesselMass(simStage);
-            stats.startThrust = VesselThrust();
+            stats.startThrust = VesselThrust(throttle, staticPressure, atmDensity, machNumber); // NK
 
             using (var engines = FindActiveEngines())
             {
@@ -347,32 +347,15 @@ namespace MuMech
             return sum;
         }
 
-        private double VesselIsp()
+        private double VesselThrust(float throttle, double staticPressure, double atmDensity, double machNumber)
         {
-            double sumThrust = 0;
-            double sumThrustOverIsp = 0;
-            using (var activeEngines = FindActiveEngines())
-            {
-                for(int i = 0; i < activeEngines.value.Count; i++)
-                {
-                    sumThrust += activeEngines.value[i].partThrust;
-                    sumThrustOverIsp += activeEngines.value[i].partThrust;
-                }
-            }
-            return sumThrust / sumThrustOverIsp;
-        }
+            var param = new Tuple<float, double, double, double>(throttle, staticPressure, atmDensity, machNumber);
 
-        private double VesselThrust()
-        {
-            double sumThrust = 0;
             using (var activeEngines = FindActiveEngines())
             {
-                for(int i = 0; i < activeEngines.value.Count; i++)
-                {
-                    sumThrust += activeEngines.value[i].partThrust;
-                }
+                return activeEngines.value.Slinq().Select((eng, t) => eng.EngineThrust(t.Item1, t.Item2, t.Item3, t.Item4), param).Sum();
             }
-            return sumThrust;
+            //return FindActiveEngines().Sum(eng => eng.EngineThrust(throttle, staticPressure, atmDensity, machNumber));
         }
 
         //Returns a list of engines that fire during the current simulated stage.
@@ -452,9 +435,27 @@ namespace MuMech
         // right-clicking.
         const double DRAINED = 1E-4;
 
+
+        FloatCurve atmosphereCurve;  //the function that gives Isp as a function of atmospheric pressure for this part, if it's an engine
+        bool atmChangeFlow;
+        bool useAtmCurve;
+        FloatCurve atmCurve;
+        bool useVelCurve;
+        FloatCurve velCurve;
+
+        KeyableDictionary<int, float> propellantRatios = new KeyableDictionary<int, float>(); //ratios of propellants used by this engine
         KeyableDictionary<int, ResourceFlowMode> propellantFlows = new KeyableDictionary<int, ResourceFlowMode>();  //flow modes of propellants since the engine can override them
+        float propellantSumRatioTimesDensity;    //a number used in computing propellant consumption rates
 
         readonly List<FuelNode> crossfeedSources = new List<FuelNode>();
+
+        float maxFuelFlow = 0;     //max fuel flow of this part
+        float minFuelFlow = 0;     //min fuel flow of this part
+
+        float thrustPercentage = 0;
+
+        float fwdThrustRatio = 1; // % of thrust moving the ship forwad
+        float g;                  // value of g used for engine flow rate / isp
 
         public int decoupledInStage;    //the stage in which this part will be decoupled from the rocket
         public int inverseStage;        //stage in which this part is activated
@@ -473,9 +474,6 @@ namespace MuMech
         float modulesStagedMass = 0; // the mass of the modules of this part after staging
 
         public string partName; //for debugging
-
-        Part part;
-        bool dVLinearThrust;
 
         private static readonly Pool<FuelNode> pool = new Pool<FuelNode>(Create, Reset);
 
@@ -507,12 +505,13 @@ namespace MuMech
 
         private void Init(Part part, bool dVLinearThrust)
         {
-            this.part = part;
-            this.dVLinearThrust = dVLinearThrust;
             resources.Clear();
             resourceConsumptions.Clear();
             resourceDrains.Clear();
             freeResources.Clear();
+
+            propellantRatios.Clear();
+            propellantFlows.Clear();
 
             crossfeedSources.Clear();
 
@@ -576,25 +575,91 @@ namespace MuMech
                     freeResources[r.info.id] = true;
             }
 
-            // determine if we've got at least one useful ModuleEngine
+            // TODO : handle the multiple active ModuleEngine case ( SXT engines with integrated vernier )
+
+            //record relevant engine stats
+            //ModuleEngines engine = part.Modules.OfType<ModuleEngines>().FirstOrDefault(e => e.isEnabled);
+            ModuleEngines engine = null;
             for (int i = 0; i < part.Modules.Count; i++)
             {
                 PartModule pm = part.Modules[i];
                 ModuleEngines e = pm as ModuleEngines;
                 if (e != null && e.isEnabled)
                 {
-                    // Only count engines that either are ignited or will ignite in the future:
-                    if ((HighLogic.LoadedSceneIsEditor || inverseStage < StageManager.CurrentStage || e.getIgnitionState) && (e.thrustPercentage > 0 || e.minThrust > 0))
-                    {
-                        // if an engine has been activated early, pretend it is in the current stage:
-                        if (e.getIgnitionState && inverseStage < StageManager.CurrentStage)
-                            inverseStage = StageManager.CurrentStage;
+                    engine = e;
+                    break;
+                }
+            }
 
-                        isEngine = true;
-                        isthrottleLocked = e.throttleLocked;
-                        // we only do these test for the first ModuleEngines in the Part, could any other ones actually differ?
-                        break;
+            if (engine != null)
+            {
+                //Only count engines that either are ignited or will ignite in the future:
+                if ((HighLogic.LoadedSceneIsEditor || inverseStage < StageManager.CurrentStage || engine.getIgnitionState) && (engine.thrustPercentage > 0 || engine.minThrust > 0))
+                {
+                    //if an engine has been activated early, pretend it is in the current stage:
+                    if (engine.getIgnitionState && inverseStage < StageManager.CurrentStage)
+                        inverseStage = StageManager.CurrentStage;
+
+                    isEngine = true;
+                    isthrottleLocked = engine.throttleLocked;
+                    //print(partName + " isEngine = true and inverseStage=" + inverseStage);
+                    g = engine.g;
+
+                    // If we take into account the engine rotation
+                    if (dVLinearThrust)
+                    {
+                        Vector3 thrust = Vector3.zero;
+                        for (int i = 0; i < engine.thrustTransforms.Count; i++)
+                        {
+                            thrust -= engine.thrustTransforms[i].forward * engine.thrustTransformMultipliers[i];
+                        }
+
+                        Vector3d fwd = HighLogic.LoadedScene == GameScenes.EDITOR ? EditorLogic.VesselRotation * Vector3d.up : engine.part.vessel.GetTransform().up;
+                        fwdThrustRatio = Vector3.Dot(fwd, thrust);
                     }
+                    else
+                    {
+                        fwdThrustRatio = 1;
+                    }
+
+                    thrustPercentage = engine.thrustPercentage;
+
+                    minFuelFlow = engine.minFuelFlow;
+                    maxFuelFlow = engine.maxFuelFlow;
+
+                    // Some brilliant engine mod seems to consider that FuelFlow is not something they should properly initialize
+                    if (minFuelFlow == 0 && engine.minThrust > 0)
+                    {
+                        minFuelFlow = engine.minThrust / (engine.atmosphereCurve.Evaluate(0f) * engine.g);
+                    }
+                    if (maxFuelFlow == 0 && engine.maxThrust > 0)
+                    {
+                        maxFuelFlow = engine.maxThrust / (engine.atmosphereCurve.Evaluate(0f) * engine.g);
+                    }
+
+                    atmosphereCurve = new FloatCurve(engine.atmosphereCurve.Curve.keys);
+                    atmChangeFlow = engine.atmChangeFlow;
+                    useAtmCurve = engine.useAtmCurve;
+                    if (useAtmCurve)
+                        atmCurve = new FloatCurve(engine.atmCurve.Curve.keys);
+                    useVelCurve = engine.useVelCurve;
+                    if (useVelCurve)
+                        velCurve = new FloatCurve(engine.velCurve.Curve.keys);
+
+                    propellantSumRatioTimesDensity = engine.propellants.Slinq().Select(prop => prop.ratio * MuUtils.ResourceDensity(prop.id)).Sum();
+                    float ratio = propellantSumRatioTimesDensity / engine.propellants.Slinq().Where(prop => !prop.ignoreForIsp).Select(prop => prop.ratio * MuUtils.ResourceDensity(prop.id)).Sum();
+                    maxFuelFlow *= ratio;
+                    minFuelFlow *= ratio;
+                    propellantRatios.Clear();
+                    propellantFlows.Clear();
+                    var dics = new Tuple<KeyableDictionary<int, float>, KeyableDictionary<int, ResourceFlowMode>>(propellantRatios, propellantFlows);
+                    engine.propellants.Slinq()
+                        .Where(prop => MuUtils.ResourceDensity(prop.id) > 0)
+                        .ForEach((p, dic) =>
+                        {
+                            dic.Item1.Add(p.id, p.ratio);
+                            dic.Item2.Add(p.id, p.GetFlowMode());
+                        }, dics);
                 }
             }
         }
@@ -807,97 +872,25 @@ namespace MuMech
             Dispatcher.InvokeAsync(() => MonoBehaviour.print("[MechJeb2] " + message));
         }
 
-        public double partThrust;
-
-        public void SetConsumptionRates(float throttle, double atmospheres, double atmDensity, double machNumber)
+        public void SetConsumptionRates(float throttle, double atmDensity, double machNumber)
         {
             if (isEngine)
             {
+                double flowModifier = GetFlowModifier(atmDensity, machNumber);
+
+                double massFlowRate = Mathf.Lerp(minFuelFlow, maxFuelFlow, throttle * 0.01f * thrustPercentage) * flowModifier;
+
+                isDrawingResources = massFlowRate > 0;
+
+                //propellant consumption rate = ratio * massFlowRate / sum(ratio * density)
+                //resourceConsumptions = propellantRatios.Keys.ToDictionary(id => id, id => propellantRatios[id] * massFlowRate / propellantSumRatioTimesDensity);
                 resourceConsumptions.Clear();
-                propellantFlows.Clear();
-
-                double sumThrustOverIsp = 0;
-                partThrust = 0;
-
-                isDrawingResources = false;
-
-                for (int i = 0; i < part.Modules.Count; i++)
+                for (int i = 0; i < propellantRatios.KeysList.Count; i++)
                 {
-                    PartModule pm = part.Modules[i];
-                    ModuleEngines e = pm as ModuleEngines;
-
-                    if (e != null && e.isEnabled)
-                    {
-                        // thrust is correct.
-                        Vector3d thrust;
-                        // note that isp and massFlowRate do not include ignoreForIsp fuels like HTP and so need to be fixed for effective isp and the
-                        // actual mdot of the rocket needs to be fixed to include HTP.
-                        //
-                        // IMHO: using ignoreForIsp is just wrong.  full stop.  engines should never set this and should set the correct effective isp in
-                        // the config for the engine.  makes everything simpler and fixes the UI to show the correct ISP.  going this direction we are going
-                        // to get bug reports that e.g. mechjeb is reporting 299s for an RD-108 when RF and KSP are displaying 308s everywhere.  which is not
-                        // going to be a bug at all.  as long as the thrust is correct, the effective isp is correct, and the fuel fractions are correct then
-                        // the rocket equation just works and HTP should not be "ignored".   keeping it out of the atmosphereCurve just makes this annoying
-                        // here and screws up the KSP API display of ISP.
-                        //
-                        double isp, massFlowRate;
-                        e.EngineValuesAtConditions(throttle, atmospheres, atmDensity, machNumber, out thrust, out isp, out massFlowRate, cosLoss: dVLinearThrust);
-                        partThrust += thrust.magnitude;
-
-                        if ( massFlowRate > 0 )
-                            isDrawingResources = true;
-
-                        double totalDensity = 0;
-
-                        for(int j = 0; j < e.propellants.Count; j++)
-                        {
-                            var p = e.propellants[j];
-                            double density = MuUtils.ResourceDensity(p.id);
-
-                            // zero density draws (eC, air intakes, etc) are skipped, we have to assume you open your solar panels or
-                            // air intakes or whatever it is you need for them to function.  they don't affect the mass of the vehicle
-                            // so they do not affect the rocket equation.  they are assumed to be "renewable" or effectively infinite.
-                            // (we keep them out of the propellantFlows dict here so they're just ignored by the sim later).
-                            //
-                            if (density > 0)
-                            {
-                                // hopefully different EngineModules in the same part don't have different flow modes for the same propellant
-                                if (!propellantFlows.ContainsKey(p.id))
-                                    propellantFlows.Add(p.id, p.GetFlowMode());
-                            }
-
-                            // have to ignore ignoreForIsp fuels here since we're dealing with the massflowrate of the other fuels
-                            if (!p.ignoreForIsp)
-                            {
-                                totalDensity += p.ratio * density;
-                            }
-                        }
-
-                        // this is also the volume flow rate of the non-ignoreForIsp fuels.  although this is a bit janky since the p.ratios in most
-                        // stock engines sum up to 2, not 1 (1.1 + 0.9), so this is not per-liter but per-summed-ratios (the massflowrate you get out
-                        // of the atmosphere curves (above) are also similarly adjusted by these ratios -- it is a bit of a horror show).
-                        double volumeFlowRate = massFlowRate / totalDensity;
-
-                        for(int j = 0; j < e.propellants.Count; j++)
-                        {
-                            var p = e.propellants[j];
-                            double density = MuUtils.ResourceDensity(p.id);
-
-                            // this is the individual propellant volume rate.  we are including the ignoreForIsp fuels in this loop and this will
-                            // correctly calculate the volume rates of all the propellants, in L/sec.  if you sum these it'll be larger than the
-                            // volumeFlowRate by including both the ignoreForIsp fuels and if the ratios sum up to more than one.
-                            double propVolumeRate = p.ratio * volumeFlowRate;
-
-                            // same density check here as above to keep massless propellants out of the ResourceConsumptions dict as well
-                            if (density > 0)
-                            {
-                                if (resourceConsumptions.ContainsKey(p.id))
-                                    resourceConsumptions[p.id] += propVolumeRate;
-                                else
-                                    resourceConsumptions.Add(p.id, propVolumeRate);
-                            }
-                        }
-                    }
+                    int id = propellantRatios.KeysList[i];
+                    double rate = propellantRatios[id] * massFlowRate / propellantSumRatioTimesDensity;
+                    //print(partName + " SetConsumptionRates for " + PartResourceLibrary.Instance.GetDefinition(id).name + " is " + rate + " flowModifier=" + flowModifier + " massFlowRate="+ massFlowRate);
+                    resourceConsumptions.Add(id, rate);
                 }
             }
         }
@@ -936,6 +929,17 @@ namespace MuMech
             double resMass = resources.KeysList.Slinq().Select((r, rs) => rs[r] * MuUtils.ResourceDensity(r), resources).Sum();
             return dryMass + resMass +
                    (inverseStage < simStage ? modulesUnstagedMass : modulesStagedMass);
+        }
+
+        public double EngineThrust(float throttle, double atmospheres, double atmDensity, double machNumber)
+        {
+            float Isp = atmosphereCurve.Evaluate((float)atmospheres);
+
+            double flowModifier = GetFlowModifier(atmDensity, machNumber);
+
+            double thrust = Mathf.Lerp(minFuelFlow, maxFuelFlow, throttle * 0.01f * thrustPercentage) * flowModifier * Isp * g;
+
+            return thrust * fwdThrustRatio;
         }
 
         public void ResetDrainRates()
@@ -1114,5 +1118,24 @@ namespace MuMech
                 }
             }
         }
+
+        private double GetFlowModifier(double atmDensity, double machNumber)
+        {
+            double flowModifier = 1.0f;
+            if (atmChangeFlow)
+            {
+                flowModifier = atmDensity * (1d / 1.225);
+                if (useAtmCurve)
+                {
+                    flowModifier = atmCurve.Evaluate((float) flowModifier);
+                }
+            }
+            if (useVelCurve)
+            {
+                flowModifier = flowModifier * velCurve.Evaluate((float)machNumber);
+            }
+            return flowModifier;
+        }
+
     }
 }
