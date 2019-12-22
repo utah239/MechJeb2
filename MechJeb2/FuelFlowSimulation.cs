@@ -349,7 +349,7 @@ namespace MuMech
 
         private double VesselThrust(float throttle, double staticPressure, double atmDensity, double machNumber)
         {
-            var param = new Tuple<float, double, double, double>(throttle, staticPressure, atmDensity, machNumber);
+            var param = new Smooth.Algebraics.Tuple<float, double, double, double>(throttle, staticPressure, atmDensity, machNumber);
 
             using (var activeEngines = FindActiveEngines())
             {
@@ -652,7 +652,7 @@ namespace MuMech
                     minFuelFlow *= ratio;
                     propellantRatios.Clear();
                     propellantFlows.Clear();
-                    var dics = new Tuple<KeyableDictionary<int, float>, KeyableDictionary<int, ResourceFlowMode>>(propellantRatios, propellantFlows);
+                    var dics = new Smooth.Algebraics.Tuple<KeyableDictionary<int, float>, KeyableDictionary<int, ResourceFlowMode>>(propellantRatios, propellantFlows);
                     engine.propellants.Slinq()
                         .Where(prop => MuUtils.ResourceDensity(prop.id) > 0)
                         .ForEach((p, dic) =>
@@ -993,15 +993,6 @@ namespace MuMech
 
         public bool CanDrawNeededResources(List<FuelNode> vessel)
         {
-            // XXX: this fix is intended to fix SRBs which have burned out but which
-            // still have an amount of fuel over the resourceRequestRemainingThreshold, which
-            // can happen in RealismOverhaul.  this targets specifically "No propellants" because
-            // we do not want flamed out jet engines to trigger this code if they just don't have
-            // enough intake air, and any other causes.
-            ModuleEngines e = part.Modules[0] as ModuleEngines;
-            if (e != null && e.flameout && e.statusL2 == "No propellants")
-                return false;
-
             foreach (int type in resourceConsumptions.KeysList)
             {
                 var resourceFlowMode = propellantFlows[type];
